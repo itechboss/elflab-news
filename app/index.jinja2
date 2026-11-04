@@ -54,6 +54,7 @@ header p{color:var(--text-dim);font-size:.9rem;margin-top:4px}
 .badge-trending-repo{background:rgba(240,136,62,.15);color:var(--cat-trending)}
 .stars{color:var(--orange)}
 .velocity{color:var(--green)}
+.yt{color:#f00}
 .source{opacity:.7}
 
 .empty{text-align:center;padding:40px;color:var(--text-dim)}
@@ -102,6 +103,8 @@ footer a:hover{color:var(--accent)}
           {% endif %}
         {% elif item.source == 'hn' %}
           <span class="stars">▲ {{ item.stars or 0 }} pts</span>
+        {% elif item.source == 'youtube' %}
+          <span class="yt">▶ {{ item.description }}</span>
         {% endif %}
         <span class="source">{{ item.source }}</span>
         {% if item.collected_at %}

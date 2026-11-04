@@ -242,9 +242,72 @@ async def collect_rss():
     log.info("RSS: collected %d entries from %d feeds", count, len(RSS_FEEDS))
 
 
+# ── YouTube (RSS) ────────────────────────────────────────────
+
+YOUTUBE_CHANNELS = [
+    ("UCdngmbVKX1Tgre699-XLlUA", "TechWorld with Nana"),
+    ("UC9-y-6csu5WGm29I7JiwpnA", "NetworkChuck"),
+    ("UCsBjURrPoezykLs9EqgamOA", "Fireship"),
+    ("UCfz8x0lVzJpb_dgWm9kPVrw", "DevOps Toolkit"),
+]
+
+
+async def collect_youtube():
+    log.info("Collecting YouTube channels...")
+    count = 0
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        for channel_id, channel_name in YOUTUBE_CHANNELS:
+            feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+            try:
+                resp = await client.get(feed_url)
+                resp.raise_for_status()
+                feed = feedparser.parse(resp.text)
+            except Exception:
+                log.exception("YouTube RSS error: %s", channel_name)
+                continue
+
+            for entry in feed.entries[:5]:
+                title = entry.get("title", "")
+                url = entry.get("link", "")
+                if not url:
+                    continue
+
+                source_id = entry.get("yt_videoid", "") or entry.get("id", url)
+
+                published = None
+                for date_field in ("published_parsed", "updated_parsed"):
+                    parsed = entry.get(date_field)
+                    if parsed:
+                        try:
+                            published = datetime(*parsed[:6],
+                                                 tzinfo=timezone.utc).isoformat()
+                        except Exception:
+                            pass
+                        break
+
+                cat = categorize(title)
+
+                insert_item(
+                    source="youtube",
+                    source_id=source_id,
+                    url=url,
+                    title=title,
+                    description=channel_name,
+                    score=45,
+                    velocity=0,
+                    category=cat or "tools",
+                    published_at=published,
+                )
+                count += 1
+
+    log.info("YouTube: collected %d videos from %d channels",
+             count, len(YOUTUBE_CHANNELS))
+
+
 # ── Run all ──────────────────────────────────────────────────
 
 async def collect_all():
     await collect_github()
     await collect_hn()
     await collect_rss()
+    await collect_youtube()
