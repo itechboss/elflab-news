@@ -1,0 +1,684 @@
+---
+# ============================================================
+# elflab-news — DevOps & AI Radar
+# Сгенерировано assemble.sh — НЕ РЕДАКТИРОВАТЬ ВРУЧНУЮ
+# Редактируй файлы в app/ и запускай ./assemble.sh
+# ============================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elflab-news-code
+  namespace: elflab-news
+data:
+  main.py: |
+    """elflab-news — curated DevOps/AI/Infra news feed."""
+    
+    import asyncio
+    import logging
+    import os
+    from pathlib import Path
+    
+    from aiohttp import web
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    
+    import db
+    from collectors import collect_all
+    from digest import generate_digest
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    log = logging.getLogger("main")
+    
+    DATA_DIR = os.environ.get("DATA_DIR", "/data")
+    PORT = int(os.environ.get("PORT", "8080"))
+    
+    
+    async def run_collect_and_digest():
+        try:
+            await collect_all()
+            generate_digest()
+        except Exception:
+            log.exception("collect+digest failed")
+    
+    
+    async def index_handler(request):
+        index = Path(DATA_DIR) / "site" / "index.html"
+        if index.exists():
+            return web.FileResponse(index)
+        return web.Response(
+            text="<h1>elflab.eu</h1><p>First digest is being generated...</p>",
+            content_type="text/html",
+        )
+    
+    
+    async def health(request):
+        return web.Response(text="ok")
+    
+    
+    async def on_startup(app):
+        log.info("Running initial collect + digest...")
+        await run_collect_and_digest()
+    
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(run_collect_and_digest, "interval", hours=1,
+                          id="collect-digest")
+        scheduler.start()
+        app["scheduler"] = scheduler
+        log.info("Scheduler started: collect+digest every 1h")
+    
+    
+    async def on_cleanup(app):
+        if "scheduler" in app:
+            app["scheduler"].shutdown(wait=False)
+    
+    
+    app = web.Application()
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    app.router.add_get("/", index_handler)
+    app.router.add_get("/healthz", health)
+    
+    if __name__ == "__main__":
+        db.init_db(DATA_DIR)
+        log.info("elflab-news starting on :%d", PORT)
+        web.run_app(app, host="0.0.0.0", port=PORT)
+
+  collectors.py: |
+    """Collectors: GitHub Trending + Hacker News."""
+    
+    import logging
+    import math
+    import os
+    import re
+    from datetime import datetime, timedelta, timezone
+    
+    import httpx
+    
+    from db import insert_item
+    
+    log = logging.getLogger("collectors")
+    
+    GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+    
+    CATEGORIES = {
+        "ai-ml":    ["llm", "gpt", "transformer", "neural", "inference",
+                     "ml", "ai", "model", "training", "rag", "diffusion",
+                     "embedding", "langchain", "openai", "anthropic", "ollama"],
+        "security": ["cve", "vulnerability", "exploit", "security", "auth",
+                     "zero-day", "supply-chain", "pentest", "malware", "firewall"],
+        "infra":    ["kubernetes", "k8s", "docker", "terraform", "ansible",
+                     "cloud", "aws", "gcp", "azure", "helm", "cilium",
+                     "istio", "envoy", "proxmox", "containerd", "cni"],
+        "tools":    ["cli", "tool", "framework", "library", "sdk", "plugin",
+                     "extension", "editor", "terminal", "shell", "tui"],
+    }
+    
+    HN_DOMAIN_WHITELIST = {
+        "github.com", "arxiv.org", "blog.cloudflare.com", "kubernetes.io",
+        "engineering.fb.com", "cloud.google.com", "aws.amazon.com",
+        "openai.com", "anthropic.com", "huggingface.co",
+    }
+    
+    HN_KEYWORD_RE = re.compile(
+        r"\b(devops|infra|kubernetes|k8s|docker|cloud|aws|gcp|azure|"
+        r"terraform|ansible|helm|ci/cd|pipeline|sre|observability|"
+        r"ai|llm|gpt|ml|neural|model|training|inference|rag|"
+        r"rust|go|python|wasm|linux|nixos|security|cve|exploit|"
+        r"open.?source|self.?host)\b", re.IGNORECASE)
+    
+    
+    def categorize(title, description=""):
+        text = f"{title} {description or ''}".lower()
+        for cat, keywords in CATEGORIES.items():
+            if any(kw in text for kw in keywords):
+                return cat
+        return None
+    
+    
+    # ── GitHub Trending ──────────────────────────────────────────
+    
+    async def collect_github():
+        log.info("Collecting GitHub trending repos...")
+        headers = {"Accept": "application/vnd.github+json"}
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    
+        now = datetime.now(timezone.utc)
+        count = 0
+    
+        for window_days, min_stars in [(7, 500), (3, 100)]:
+            since = (now - timedelta(days=window_days)).strftime("%Y-%m-%d")
+            url = (
+                "https://api.github.com/search/repositories"
+                f"?q=created:>{since}+stars:>{min_stars}&sort=stars&per_page=30"
+            )
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.get(url, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+            except Exception:
+                log.exception("GitHub API error (window=%dd)", window_days)
+                continue
+    
+            for repo in data.get("items", []):
+                created = datetime.fromisoformat(
+                    repo["created_at"].replace("Z", "+00:00"))
+                days = max(1, (now - created).total_seconds() / 86400)
+                velocity = repo["stargazers_count"] / days
+    
+                cat = categorize(repo["name"], repo.get("description", ""))
+                if not cat:
+                    cat = "trending-repo"
+    
+                score = min(100, velocity / 5)
+    
+                insert_item(
+                    source="github",
+                    source_id=str(repo["id"]),
+                    url=repo["html_url"],
+                    title=repo["full_name"],
+                    description=repo.get("description", ""),
+                    score=score,
+                    velocity=velocity,
+                    category=cat,
+                    language=repo.get("language"),
+                    stars=repo["stargazers_count"],
+                    published_at=repo["created_at"],
+                )
+                count += 1
+    
+        log.info("GitHub: collected %d repos", count)
+    
+    
+    # ── Hacker News ──────────────────────────────────────────────
+    
+    def _hn_is_relevant(item):
+        title = item.get("title", "")
+        url = item.get("url", "")
+        if any(d in url for d in HN_DOMAIN_WHITELIST):
+            return True
+        if HN_KEYWORD_RE.search(title):
+            return True
+        return False
+    
+    
+    async def collect_hn():
+        log.info("Collecting Hacker News top stories...")
+        count = 0
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(
+                    "https://hacker-news.firebaseio.com/v0/topstories.json")
+                resp.raise_for_status()
+                top_ids = resp.json()[:100]
+    
+                for item_id in top_ids:
+                    try:
+                        r = await client.get(
+                            f"https://hacker-news.firebaseio.com/v0/item/{item_id}.json")
+                        r.raise_for_status()
+                        item = r.json()
+                    except Exception:
+                        continue
+    
+                    if not item or item.get("type") != "story":
+                        continue
+                    if (item.get("score", 0) < 100
+                            and not _hn_is_relevant(item)):
+                        continue
+                    if not _hn_is_relevant(item) and item.get("score", 0) < 200:
+                        continue
+    
+                    hn_score = item.get("score", 0)
+                    descendants = item.get("descendants", 0)
+                    raw = hn_score * math.log(descendants + 2)
+                    score = min(100, raw / 50)
+    
+                    url = item.get("url") or f"https://news.ycombinator.com/item?id={item_id}"
+                    title = item.get("title", "")
+                    cat = categorize(title)
+    
+                    published = datetime.fromtimestamp(
+                        item.get("time", 0), tz=timezone.utc
+                    ).isoformat() if item.get("time") else None
+    
+                    insert_item(
+                        source="hn",
+                        source_id=str(item_id),
+                        url=url,
+                        title=title,
+                        description=f"{hn_score} points · {descendants} comments",
+                        score=score,
+                        velocity=0,
+                        category=cat or "tools",
+                        stars=hn_score,
+                        published_at=published,
+                    )
+                    count += 1
+        except Exception:
+            log.exception("HN API error")
+    
+        log.info("HN: collected %d stories", count)
+    
+    
+    # ── Run all ──────────────────────────────────────────────────
+    
+    async def collect_all():
+        await collect_github()
+        await collect_hn()
+
+  digest.py: |
+    """Generate static index.html from Jinja2 template + DB items."""
+    
+    import logging
+    import os
+    from datetime import datetime, timezone
+    from pathlib import Path
+    
+    from jinja2 import Environment, FileSystemLoader
+    
+    from db import get_items_for_digest, record_digest
+    
+    log = logging.getLogger("digest")
+    
+    DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+    APP_DIR = Path(os.environ.get("APP_DIR", "/app"))
+    
+    
+    def generate_digest():
+        items = get_items_for_digest(limit=60, hours=72)
+        log.info("Generating digest with %d items", len(items))
+    
+        site_dir = DATA_DIR / "site"
+        site_dir.mkdir(parents=True, exist_ok=True)
+    
+        env = Environment(loader=FileSystemLoader(str(APP_DIR)))
+        template = env.get_template("index.jinja2")
+    
+        categories = {}
+        for item in items:
+            cat = item.get("category") or "tools"
+            categories.setdefault(cat, 0)
+            categories[cat] += 1
+    
+        html = template.render(
+            items=items,
+            categories=sorted(categories.keys()),
+            generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            total_count=len(items),
+        )
+    
+        out = site_dir / "index.html"
+        tmp = site_dir / "index.html.tmp"
+        tmp.write_text(html, encoding="utf-8")
+        tmp.replace(out)
+    
+        record_digest(len(items))
+        log.info("Digest written to %s (%d bytes)", out, len(html))
+
+  db.py: |
+    """SQLite storage for news items."""
+    
+    import sqlite3
+    from pathlib import Path
+    
+    _db_path = None
+    
+    
+    def init_db(data_dir: str):
+        global _db_path
+        _db_path = Path(data_dir) / "news.db"
+        conn = sqlite3.connect(str(_db_path), timeout=10)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS items (
+                id           INTEGER PRIMARY KEY,
+                source       TEXT NOT NULL,
+                source_id    TEXT NOT NULL,
+                url          TEXT NOT NULL,
+                title        TEXT NOT NULL,
+                description  TEXT,
+                score        REAL DEFAULT 0,
+                velocity     REAL DEFAULT 0,
+                category     TEXT,
+                language     TEXT,
+                stars        INTEGER,
+                collected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                published_at DATETIME,
+                UNIQUE(source, source_id)
+            );
+            CREATE TABLE IF NOT EXISTS digests (
+                id           INTEGER PRIMARY KEY,
+                generated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                item_count   INTEGER
+            );
+        """)
+        conn.close()
+    
+    
+    def _conn():
+        return sqlite3.connect(str(_db_path), timeout=10)
+    
+    
+    def insert_item(*, source, source_id, url, title, description=None,
+                    score=0, velocity=0, category=None, language=None,
+                    stars=None, published_at=None):
+        conn = _conn()
+        conn.execute(
+            """INSERT OR IGNORE INTO items
+               (source, source_id, url, title, description, score, velocity,
+                category, language, stars, published_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (source, source_id, url, title, description, score, velocity,
+             category, language, stars, published_at))
+        conn.commit()
+        conn.close()
+    
+    
+    def update_score(item_id, score, velocity):
+        conn = _conn()
+        conn.execute(
+            "UPDATE items SET score=?, velocity=? WHERE id=?",
+            (score, velocity, item_id))
+        conn.commit()
+        conn.close()
+    
+    
+    def get_items_for_digest(limit=60, hours=72):
+        conn = _conn()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT * FROM items
+               WHERE collected_at > datetime('now', ?)
+               ORDER BY score DESC LIMIT ?""",
+            (f"-{hours} hours", limit)).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    
+    
+    def record_digest(item_count):
+        conn = _conn()
+        conn.execute("INSERT INTO digests (item_count) VALUES (?)", (item_count,))
+        conn.commit()
+        conn.close()
+
+  index.jinja2: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>elflab.eu — DevOps & AI Radar</title>
+    <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    :root{
+      --bg:#0d1117;--surface:#161b22;--border:#30363d;
+      --text:#c9d1d9;--text-dim:#8b949e;--text-bright:#f0f6fc;
+      --accent:#58a6ff;--orange:#f0883e;--green:#3fb950;--red:#f85149;
+      --cat-ai:#d2a8ff;--cat-security:#f85149;--cat-infra:#58a6ff;
+      --cat-tools:#3fb950;--cat-trending:#f0883e;
+    }
+    body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;line-height:1.5;min-height:100vh}
+    a{color:var(--accent);text-decoration:none}
+    a:hover{text-decoration:underline}
+    .container{max-width:800px;margin:0 auto;padding:16px}
+    
+    header{padding:32px 0 24px;text-align:center}
+    header h1{font-size:1.5rem;color:var(--text-bright);font-weight:600}
+    header p{color:var(--text-dim);font-size:.9rem;margin-top:4px}
+    
+    .filters{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-bottom:24px}
+    .filters button{
+      background:var(--surface);color:var(--text-dim);border:1px solid var(--border);
+      border-radius:20px;padding:6px 14px;font-size:.8rem;cursor:pointer;
+      transition:all .15s ease;
+    }
+    .filters button:hover{border-color:var(--text-dim);color:var(--text)}
+    .filters button.active{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+    
+    .cards{display:flex;flex-direction:column;gap:12px}
+    .card{
+      background:var(--surface);border:1px solid var(--border);border-radius:8px;
+      padding:16px;transition:border-color .15s ease;
+    }
+    .card:hover{border-color:var(--text-dim)}
+    .card-title{font-size:1rem;font-weight:600;color:var(--text-bright);margin-bottom:4px}
+    .card-title a{color:var(--text-bright)}
+    .card-desc{font-size:.85rem;color:var(--text-dim);margin-bottom:8px;
+      display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+    .card-meta{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:.75rem;color:var(--text-dim)}
+    .badge{
+      display:inline-block;padding:2px 8px;border-radius:12px;font-size:.7rem;
+      font-weight:500;text-transform:uppercase;letter-spacing:.3px;
+    }
+    .badge-ai-ml{background:rgba(210,168,255,.15);color:var(--cat-ai)}
+    .badge-security{background:rgba(248,81,73,.15);color:var(--cat-security)}
+    .badge-infra{background:rgba(88,166,255,.15);color:var(--cat-infra)}
+    .badge-tools{background:rgba(63,185,80,.15);color:var(--cat-tools)}
+    .badge-trending-repo{background:rgba(240,136,62,.15);color:var(--cat-trending)}
+    .stars{color:var(--orange)}
+    .velocity{color:var(--green)}
+    .source{opacity:.7}
+    
+    .empty{text-align:center;padding:40px;color:var(--text-dim)}
+    
+    footer{text-align:center;padding:32px 0;color:var(--text-dim);font-size:.8rem;border-top:1px solid var(--border);margin-top:32px}
+    footer a{color:var(--text-dim)}
+    footer a:hover{color:var(--accent)}
+    
+    @media(max-width:600px){
+      .container{padding:12px}
+      header h1{font-size:1.25rem}
+      .card{padding:12px}
+    }
+    </style>
+    </head>
+    <body>
+    <div class="container">
+      <header>
+        <h1>elflab.eu — DevOps &amp; AI Radar</h1>
+        <p>Curated by Victor Padalco · Updated {{ generated_at }}</p>
+      </header>
+    
+      <div class="filters">
+        <button class="active" data-filter="all">All ({{ total_count }})</button>
+        {% for cat in categories %}
+        <button data-filter="{{ cat }}">{{ cat | replace('-', ' ') | title }}</button>
+        {% endfor %}
+      </div>
+    
+      <div class="cards">
+        {% for item in items %}
+        <div class="card" data-category="{{ item.category or 'tools' }}">
+          <div class="card-title"><a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.title }}</a></div>
+          {% if item.description %}
+          <div class="card-desc">{{ item.description }}</div>
+          {% endif %}
+          <div class="card-meta">
+            <span class="badge badge-{{ item.category or 'tools' }}">{{ item.category or 'tools' }}</span>
+            {% if item.source == 'github' %}
+              <span class="stars">★ {{ "{:,}".format(item.stars or 0) }}</span>
+              {% if item.velocity %}
+              <span class="velocity">▲ {{ "%.0f" | format(item.velocity) }}/day</span>
+              {% endif %}
+              {% if item.language %}
+              <span>{{ item.language }}</span>
+              {% endif %}
+            {% elif item.source == 'hn' %}
+              <span class="stars">▲ {{ item.stars or 0 }} pts</span>
+            {% endif %}
+            <span class="source">{{ item.source }}</span>
+            {% if item.collected_at %}
+            <span>{{ item.collected_at[:16] }}</span>
+            {% endif %}
+          </div>
+        </div>
+        {% else %}
+        <div class="empty">No items yet. First collection is running...</div>
+        {% endfor %}
+      </div>
+    
+      <footer>
+        <p>Victor Padalco · <a href="https://github.com/itechboss">github.com/itechboss</a></p>
+        <p style="margin-top:4px">Generated {{ generated_at }}</p>
+      </footer>
+    </div>
+    
+    <script>
+    document.querySelector('.filters').addEventListener('click', function(e) {
+      if (e.target.tagName !== 'BUTTON') return;
+      this.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+      e.target.classList.add('active');
+      var f = e.target.dataset.filter;
+      document.querySelectorAll('.card').forEach(function(c) {
+        c.style.display = (f === 'all' || c.dataset.category === f) ? '' : 'none';
+      });
+    });
+    </script>
+    </body>
+    </html>
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elflab-news
+  namespace: elflab-news
+  labels:
+    app: elflab-news
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: elflab-news
+  template:
+    metadata:
+      labels:
+        app: elflab-news
+      annotations:
+        checksum/code: "17c6b586b5bc6f01"
+    spec:
+      initContainers:
+        - name: install-deps
+          image: python:3.12-slim
+          command:
+            - pip
+            - install
+            - --target=/deps
+            - --no-cache-dir
+            - httpx==0.28.1
+            - jinja2==3.1.6
+            - aiohttp==3.11.18
+            - apscheduler==3.10.4
+          volumeMounts:
+            - name: deps
+              mountPath: /deps
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      containers:
+        - name: elflab-news
+          image: python:3.12-slim
+          command: ["python", "/app/main.py"]
+          env:
+            - name: PYTHONPATH
+              value: "/deps:/app"
+            - name: DATA_DIR
+              value: "/data"
+            - name: APP_DIR
+              value: "/app"
+            - name: PORT
+              value: "8080"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: elflab-news-secrets
+                  key: GITHUB_TOKEN
+                  optional: true
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+            - name: deps
+              mountPath: /deps
+            - name: data
+              mountPath: /data
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 60
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+      restartPolicy: Always
+      volumes:
+        - name: app-code
+          configMap:
+            name: elflab-news-code
+        - name: deps
+          emptyDir: {}
+        - name: data
+          persistentVolumeClaim:
+            claimName: elflab-news-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elflab-news
+  namespace: elflab-news
+spec:
+  selector:
+    app: elflab-news
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: elflab-news
+  namespace: elflab-news
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - elflab.eu
+      secretName: elflab-news-tls
+  rules:
+    - host: elflab.eu
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: elflab-news
+                port:
+                  number: 8080

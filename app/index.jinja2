@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>elflab.eu — DevOps & AI Radar</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0d1117;--surface:#161b22;--border:#30363d;
+  --text:#c9d1d9;--text-dim:#8b949e;--text-bright:#f0f6fc;
+  --accent:#58a6ff;--orange:#f0883e;--green:#3fb950;--red:#f85149;
+  --cat-ai:#d2a8ff;--cat-security:#f85149;--cat-infra:#58a6ff;
+  --cat-tools:#3fb950;--cat-trending:#f0883e;
+}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;line-height:1.5;min-height:100vh}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.container{max-width:800px;margin:0 auto;padding:16px}
+
+header{padding:32px 0 24px;text-align:center}
+header h1{font-size:1.5rem;color:var(--text-bright);font-weight:600}
+header p{color:var(--text-dim);font-size:.9rem;margin-top:4px}
+
+.filters{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-bottom:24px}
+.filters button{
+  background:var(--surface);color:var(--text-dim);border:1px solid var(--border);
+  border-radius:20px;padding:6px 14px;font-size:.8rem;cursor:pointer;
+  transition:all .15s ease;
+}
+.filters button:hover{border-color:var(--text-dim);color:var(--text)}
+.filters button.active{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+
+.cards{display:flex;flex-direction:column;gap:12px}
+.card{
+  background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  padding:16px;transition:border-color .15s ease;
+}
+.card:hover{border-color:var(--text-dim)}
+.card-title{font-size:1rem;font-weight:600;color:var(--text-bright);margin-bottom:4px}
+.card-title a{color:var(--text-bright)}
+.card-desc{font-size:.85rem;color:var(--text-dim);margin-bottom:8px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.card-meta{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:.75rem;color:var(--text-dim)}
+.badge{
+  display:inline-block;padding:2px 8px;border-radius:12px;font-size:.7rem;
+  font-weight:500;text-transform:uppercase;letter-spacing:.3px;
+}
+.badge-ai-ml{background:rgba(210,168,255,.15);color:var(--cat-ai)}
+.badge-security{background:rgba(248,81,73,.15);color:var(--cat-security)}
+.badge-infra{background:rgba(88,166,255,.15);color:var(--cat-infra)}
+.badge-tools{background:rgba(63,185,80,.15);color:var(--cat-tools)}
+.badge-trending-repo{background:rgba(240,136,62,.15);color:var(--cat-trending)}
+.stars{color:var(--orange)}
+.velocity{color:var(--green)}
+.source{opacity:.7}
+
+.empty{text-align:center;padding:40px;color:var(--text-dim)}
+
+footer{text-align:center;padding:32px 0;color:var(--text-dim);font-size:.8rem;border-top:1px solid var(--border);margin-top:32px}
+footer a{color:var(--text-dim)}
+footer a:hover{color:var(--accent)}
+
+@media(max-width:600px){
+  .container{padding:12px}
+  header h1{font-size:1.25rem}
+  .card{padding:12px}
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>elflab.eu — DevOps &amp; AI Radar</h1>
+    <p>Curated by Victor Padalco · Updated {{ generated_at }}</p>
+  </header>
+
+  <div class="filters">
+    <button class="active" data-filter="all">All ({{ total_count }})</button>
+    {% for cat in categories %}
+    <button data-filter="{{ cat }}">{{ cat | replace('-', ' ') | title }}</button>
+    {% endfor %}
+  </div>
+
+  <div class="cards">
+    {% for item in items %}
+    <div class="card" data-category="{{ item.category or 'tools' }}">
+      <div class="card-title"><a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.title }}</a></div>
+      {% if item.description %}
+      <div class="card-desc">{{ item.description }}</div>
+      {% endif %}
+      <div class="card-meta">
+        <span class="badge badge-{{ item.category or 'tools' }}">{{ item.category or 'tools' }}</span>
+        {% if item.source == 'github' %}
+          <span class="stars">★ {{ "{:,}".format(item.stars or 0) }}</span>
+          {% if item.velocity %}
+          <span class="velocity">▲ {{ "%.0f" | format(item.velocity) }}/day</span>
+          {% endif %}
+          {% if item.language %}
+          <span>{{ item.language }}</span>
+          {% endif %}
+        {% elif item.source == 'hn' %}
+          <span class="stars">▲ {{ item.stars or 0 }} pts</span>
+        {% endif %}
+        <span class="source">{{ item.source }}</span>
+        {% if item.collected_at %}
+        <span>{{ item.collected_at[:16] }}</span>
+        {% endif %}
+      </div>
+    </div>
+    {% else %}
+    <div class="empty">No items yet. First collection is running...</div>
+    {% endfor %}
+  </div>
+
+  <footer>
+    <p>Victor Padalco · <a href="https://github.com/itechboss">github.com/itechboss</a></p>
+    <p style="margin-top:4px">Generated {{ generated_at }}</p>
+  </footer>
+</div>
+
+<script>
+document.querySelector('.filters').addEventListener('click', function(e) {
+  if (e.target.tagName !== 'BUTTON') return;
+  this.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+  e.target.classList.add('active');
+  var f = e.target.dataset.filter;
+  document.querySelectorAll('.card').forEach(function(c) {
+    c.style.display = (f === 'all' || c.dataset.category === f) ? '' : 'none';
+  });
+});
+</script>
+</body>
+</html>
