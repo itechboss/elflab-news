@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - Remove full name from UI, replace with "elflab"
 - Add YouTube collector: TechWorld with Nana, NetworkChuck, Fireship, DevOps Toolkit (RSS, no API key)
+- Remove GitHub profile link from footer
 
 ## [2026-11-04] - Initial Release
 
