@@ -40,6 +40,14 @@ async def index_handler(request):
     )
 
 
+async def feed_handler(request):
+    feed = Path(DATA_DIR) / "site" / "feed.xml"
+    if feed.exists():
+        return web.FileResponse(feed,
+                                headers={"Content-Type": "application/rss+xml"})
+    return web.Response(text="Feed not ready", status=503)
+
+
 async def health(request):
     return web.Response(text="ok")
 
@@ -65,6 +73,7 @@ app = web.Application()
 app.on_startup.append(on_startup)
 app.on_cleanup.append(on_cleanup)
 app.router.add_get("/", index_handler)
+app.router.add_get("/feed.xml", feed_handler)
 app.router.add_get("/healthz", health)
 
 if __name__ == "__main__":

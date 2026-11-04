@@ -1,11 +1,13 @@
-"""Collectors: GitHub Trending + Hacker News."""
+"""Collectors: GitHub Trending + Hacker News + RSS feeds."""
 
 import logging
 import math
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
+import feedparser
 import httpx
 
 from db import insert_item
@@ -176,8 +178,73 @@ async def collect_hn():
     log.info("HN: collected %d stories", count)
 
 
+# ── RSS Feeds ────────────────────────────────────────────────
+
+RSS_FEEDS = [
+    ("https://www.cncf.io/blog/feed/", "cncf"),
+    ("https://kubernetes.io/feed.xml", "k8s-blog"),
+    ("https://lobste.rs/t/devops,ai,distributed.rss", "lobsters"),
+    ("https://thenewstack.io/feed/", "thenewstack"),
+    ("https://feed.infoq.com/devops/", "infoq"),
+]
+
+
+async def collect_rss():
+    log.info("Collecting RSS feeds...")
+    count = 0
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        for feed_url, feed_name in RSS_FEEDS:
+            try:
+                resp = await client.get(feed_url)
+                resp.raise_for_status()
+                feed = feedparser.parse(resp.text)
+            except Exception:
+                log.exception("RSS error: %s", feed_name)
+                continue
+
+            for entry in feed.entries[:20]:
+                title = entry.get("title", "")
+                url = entry.get("link", "")
+                if not url:
+                    continue
+
+                source_id = entry.get("id") or url
+                description = entry.get("summary", "")
+                if len(description) > 300:
+                    description = description[:297] + "..."
+
+                published = None
+                for date_field in ("published_parsed", "updated_parsed"):
+                    parsed = entry.get(date_field)
+                    if parsed:
+                        try:
+                            published = datetime(*parsed[:6],
+                                                 tzinfo=timezone.utc).isoformat()
+                        except Exception:
+                            pass
+                        break
+
+                cat = categorize(title, description)
+
+                insert_item(
+                    source="rss",
+                    source_id=f"{feed_name}:{source_id}",
+                    url=url,
+                    title=title,
+                    description=description,
+                    score=50,
+                    velocity=0,
+                    category=cat or "infra",
+                    published_at=published,
+                )
+                count += 1
+
+    log.info("RSS: collected %d entries from %d feeds", count, len(RSS_FEEDS))
+
+
 # ── Run all ──────────────────────────────────────────────────
 
 async def collect_all():
     await collect_github()
     await collect_hn()
+    await collect_rss()

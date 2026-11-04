@@ -53,6 +53,14 @@ data:
         )
     
     
+    async def feed_handler(request):
+        feed = Path(DATA_DIR) / "site" / "feed.xml"
+        if feed.exists():
+            return web.FileResponse(feed,
+                                    headers={"Content-Type": "application/rss+xml"})
+        return web.Response(text="Feed not ready", status=503)
+    
+    
     async def health(request):
         return web.Response(text="ok")
     
@@ -78,6 +86,7 @@ data:
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     app.router.add_get("/", index_handler)
+    app.router.add_get("/feed.xml", feed_handler)
     app.router.add_get("/healthz", health)
     
     if __name__ == "__main__":
@@ -86,14 +95,16 @@ data:
         web.run_app(app, host="0.0.0.0", port=PORT)
 
   collectors.py: |
-    """Collectors: GitHub Trending + Hacker News."""
+    """Collectors: GitHub Trending + Hacker News + RSS feeds."""
     
     import logging
     import math
     import os
     import re
     from datetime import datetime, timedelta, timezone
+    from email.utils import parsedate_to_datetime
     
+    import feedparser
     import httpx
     
     from db import insert_item
@@ -264,18 +275,84 @@ data:
         log.info("HN: collected %d stories", count)
     
     
+    # ── RSS Feeds ────────────────────────────────────────────────
+    
+    RSS_FEEDS = [
+        ("https://www.cncf.io/blog/feed/", "cncf"),
+        ("https://kubernetes.io/feed.xml", "k8s-blog"),
+        ("https://lobste.rs/t/devops,ai,distributed.rss", "lobsters"),
+        ("https://thenewstack.io/feed/", "thenewstack"),
+        ("https://feed.infoq.com/devops/", "infoq"),
+    ]
+    
+    
+    async def collect_rss():
+        log.info("Collecting RSS feeds...")
+        count = 0
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            for feed_url, feed_name in RSS_FEEDS:
+                try:
+                    resp = await client.get(feed_url)
+                    resp.raise_for_status()
+                    feed = feedparser.parse(resp.text)
+                except Exception:
+                    log.exception("RSS error: %s", feed_name)
+                    continue
+    
+                for entry in feed.entries[:20]:
+                    title = entry.get("title", "")
+                    url = entry.get("link", "")
+                    if not url:
+                        continue
+    
+                    source_id = entry.get("id") or url
+                    description = entry.get("summary", "")
+                    if len(description) > 300:
+                        description = description[:297] + "..."
+    
+                    published = None
+                    for date_field in ("published_parsed", "updated_parsed"):
+                        parsed = entry.get(date_field)
+                        if parsed:
+                            try:
+                                published = datetime(*parsed[:6],
+                                                     tzinfo=timezone.utc).isoformat()
+                            except Exception:
+                                pass
+                            break
+    
+                    cat = categorize(title, description)
+    
+                    insert_item(
+                        source="rss",
+                        source_id=f"{feed_name}:{source_id}",
+                        url=url,
+                        title=title,
+                        description=description,
+                        score=50,
+                        velocity=0,
+                        category=cat or "infra",
+                        published_at=published,
+                    )
+                    count += 1
+    
+        log.info("RSS: collected %d entries from %d feeds", count, len(RSS_FEEDS))
+    
+    
     # ── Run all ──────────────────────────────────────────────────
     
     async def collect_all():
         await collect_github()
         await collect_hn()
+        await collect_rss()
 
   digest.py: |
-    """Generate static index.html from Jinja2 template + DB items."""
+    """Generate static index.html + feed.xml from Jinja2 template + DB items."""
     
     import logging
     import os
     from datetime import datetime, timezone
+    from html import escape
     from pathlib import Path
     
     from jinja2 import Environment, FileSystemLoader
@@ -286,6 +363,46 @@ data:
     
     DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
     APP_DIR = Path(os.environ.get("APP_DIR", "/app"))
+    
+    
+    def _write_atomic(path, content):
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(path)
+    
+    
+    def _generate_rss(items, site_dir):
+        now = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+        entries = []
+        for item in items[:30]:
+            pub = item.get("published_at") or item.get("collected_at") or ""
+            cat = escape(item.get("category") or "tools")
+            desc = escape(item.get("description") or "")
+            entries.append(
+                f"    <item>\n"
+                f"      <title>{escape(item['title'])}</title>\n"
+                f"      <link>{escape(item['url'])}</link>\n"
+                f"      <description>{desc}</description>\n"
+                f"      <category>{cat}</category>\n"
+                f"      <guid isPermaLink=\"false\">{escape(item.get('source',''))}:{escape(item.get('source_id',''))}</guid>\n"
+                f"    </item>"
+            )
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">\n'
+            '  <channel>\n'
+            '    <title>elflab.eu — DevOps &amp; AI Radar</title>\n'
+            '    <link>https://elflab.eu</link>\n'
+            '    <description>Curated DevOps, AI, and infrastructure news</description>\n'
+            '    <language>en</language>\n'
+            f'    <lastBuildDate>{now}</lastBuildDate>\n'
+            '    <atom:link href="https://elflab.eu/feed.xml" rel="self" type="application/rss+xml"/>\n'
+            + "\n".join(entries) + "\n"
+            '  </channel>\n'
+            '</rss>\n'
+        )
+        _write_atomic(site_dir / "feed.xml", xml)
+        log.info("RSS feed written (%d items)", len(entries))
     
     
     def generate_digest():
@@ -311,13 +428,11 @@ data:
             total_count=len(items),
         )
     
-        out = site_dir / "index.html"
-        tmp = site_dir / "index.html.tmp"
-        tmp.write_text(html, encoding="utf-8")
-        tmp.replace(out)
+        _write_atomic(site_dir / "index.html", html)
+        _generate_rss(items, site_dir)
     
         record_digest(len(items))
-        log.info("Digest written to %s (%d bytes)", out, len(html))
+        log.info("Digest written to %s (%d bytes)", site_dir / "index.html", len(html))
 
   db.py: |
     """SQLite storage for news items."""
@@ -411,6 +526,7 @@ data:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>elflab.eu — DevOps & AI Radar</title>
+    <link rel="alternate" type="application/rss+xml" title="elflab.eu RSS" href="/feed.xml">
     <style>
     *{margin:0;padding:0;box-sizing:border-box}
     :root{
@@ -521,8 +637,12 @@ data:
       </div>
     
       <footer>
-        <p>Victor Padalco · <a href="https://github.com/itechboss">github.com/itechboss</a></p>
-        <p style="margin-top:4px">Generated {{ generated_at }}</p>
+        <p><strong>Victor Padalco</strong> — DevOps Engineer · K8s / GitOps / AI Infra</p>
+        <p style="margin-top:4px">
+          <a href="https://github.com/itechboss">GitHub</a> ·
+          <a href="/feed.xml">RSS Feed</a>
+        </p>
+        <p style="margin-top:4px">Updated {{ generated_at }}</p>
       </footer>
     </div>
     
@@ -560,7 +680,7 @@ spec:
       labels:
         app: elflab-news
       annotations:
-        checksum/code: "17c6b586b5bc6f01"
+        checksum/code: "700d56bd8657b4b4"
     spec:
       initContainers:
         - name: install-deps
@@ -574,6 +694,7 @@ spec:
             - jinja2==3.1.6
             - aiohttp==3.11.18
             - apscheduler==3.10.4
+            - feedparser==6.0.11
           volumeMounts:
             - name: deps
               mountPath: /deps

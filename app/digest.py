@@ -1,8 +1,9 @@
-"""Generate static index.html from Jinja2 template + DB items."""
+"""Generate static index.html + feed.xml from Jinja2 template + DB items."""
 
 import logging
 import os
 from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
@@ -13,6 +14,46 @@ log = logging.getLogger("digest")
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 APP_DIR = Path(os.environ.get("APP_DIR", "/app"))
+
+
+def _write_atomic(path, content):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _generate_rss(items, site_dir):
+    now = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+    entries = []
+    for item in items[:30]:
+        pub = item.get("published_at") or item.get("collected_at") or ""
+        cat = escape(item.get("category") or "tools")
+        desc = escape(item.get("description") or "")
+        entries.append(
+            f"    <item>\n"
+            f"      <title>{escape(item['title'])}</title>\n"
+            f"      <link>{escape(item['url'])}</link>\n"
+            f"      <description>{desc}</description>\n"
+            f"      <category>{cat}</category>\n"
+            f"      <guid isPermaLink=\"false\">{escape(item.get('source',''))}:{escape(item.get('source_id',''))}</guid>\n"
+            f"    </item>"
+        )
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">\n'
+        '  <channel>\n'
+        '    <title>elflab.eu — DevOps &amp; AI Radar</title>\n'
+        '    <link>https://elflab.eu</link>\n'
+        '    <description>Curated DevOps, AI, and infrastructure news</description>\n'
+        '    <language>en</language>\n'
+        f'    <lastBuildDate>{now}</lastBuildDate>\n'
+        '    <atom:link href="https://elflab.eu/feed.xml" rel="self" type="application/rss+xml"/>\n'
+        + "\n".join(entries) + "\n"
+        '  </channel>\n'
+        '</rss>\n'
+    )
+    _write_atomic(site_dir / "feed.xml", xml)
+    log.info("RSS feed written (%d items)", len(entries))
 
 
 def generate_digest():
@@ -38,10 +79,8 @@ def generate_digest():
         total_count=len(items),
     )
 
-    out = site_dir / "index.html"
-    tmp = site_dir / "index.html.tmp"
-    tmp.write_text(html, encoding="utf-8")
-    tmp.replace(out)
+    _write_atomic(site_dir / "index.html", html)
+    _generate_rss(items, site_dir)
 
     record_digest(len(items))
-    log.info("Digest written to %s (%d bytes)", out, len(html))
+    log.info("Digest written to %s (%d bytes)", site_dir / "index.html", len(html))

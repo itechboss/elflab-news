@@ -80,6 +80,7 @@ spec:
             - jinja2==3.1.6
             - aiohttp==3.11.18
             - apscheduler==3.10.4
+            - feedparser==6.0.11
           volumeMounts:
             - name: deps
               mountPath: /deps
