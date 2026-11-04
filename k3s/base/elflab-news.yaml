@@ -595,7 +595,7 @@ data:
     <div class="container">
       <header>
         <h1>elflab.eu — DevOps &amp; AI Radar</h1>
-        <p>Curated by Victor Padalco · Updated {{ generated_at }}</p>
+        <p>Curated by elflab · Updated {{ generated_at }}</p>
       </header>
     
       <div class="filters">
@@ -637,7 +637,7 @@ data:
       </div>
     
       <footer>
-        <p><strong>Victor Padalco</strong> — DevOps Engineer · K8s / GitOps / AI Infra</p>
+        <p><strong>elflab</strong> — DevOps · K8s / GitOps / AI Infra</p>
         <p style="margin-top:4px">
           <a href="https://github.com/itechboss">GitHub</a> ·
           <a href="/feed.xml">RSS Feed</a>
@@ -680,7 +680,7 @@ spec:
       labels:
         app: elflab-news
       annotations:
-        checksum/code: "700d56bd8657b4b4"
+        checksum/code: "ba0883e548b348ff"
     spec:
       initContainers:
         - name: install-deps
